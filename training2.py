@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader, ConcatDataset, random_split, Dataset
 import torch.nn.functional as F
 import copy
 from sklearn.metrics import accuracy_score, f1_score, jaccard_score
-from sklearn.metrics import classification_report, confusion_matrix, roc_curve, auc
+from sklearn.metrics import classification_report
 import random  # Add this import
 
 
@@ -394,35 +394,88 @@ class FocalLoss(nn.Module):  # Focal Loss implementation
 
 
 
-def setup_model(device, train_dataset, n_classes=5, learning_rate=1e-4):  # Changed from 1e-3
+def get_optimizer(optimizer_name, model_params, learning_rate, weight_decay=1e-4, momentum=0.9):
+    """
+    Factory function to create optimizers
+    """
+    optimizers = {
+        'sgd': lambda: torch.optim.SGD(
+            model_params, 
+            lr=learning_rate,
+            momentum=momentum,
+            weight_decay=weight_decay
+        ),
+        'adam': lambda: torch.optim.Adam(
+            model_params,
+            lr=learning_rate,
+            weight_decay=weight_decay
+        ),
+        'adamw': lambda: torch.optim.AdamW(
+            model_params,
+            lr=learning_rate,
+            weight_decay=weight_decay
+        ),
+        'rmsprop': lambda: torch.optim.RMSprop(
+            model_params,
+            lr=learning_rate,
+            weight_decay=weight_decay,
+            momentum=momentum
+        ),
+        'adadelta': lambda: torch.optim.Adadelta(
+            model_params,
+            lr=learning_rate,
+            weight_decay=weight_decay
+        )
+    }
+    
+    return optimizers.get(optimizer_name.lower())()
+
+def get_scheduler(scheduler_name, optimizer, **kwargs):
+    """
+    Factory function to create learning rate schedulers
+    """
+    schedulers = {
+        'step': lambda: torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=kwargs.get('step_size', 20),
+            gamma=kwargs.get('gamma', 0.1)
+        ),
+        'plateau': lambda: torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=kwargs.get('factor', 0.5),
+            patience=kwargs.get('patience', 5),
+            min_lr=kwargs.get('min_lr', 1e-6)
+        ),
+        'cosine': lambda: torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=kwargs.get('T_max', 10),
+            eta_min=kwargs.get('min_lr', 0)
+        )
+    }
+    
+    return schedulers.get(scheduler_name.lower())()
+
+def setup_model(device, train_dataset, n_classes=5, learning_rate=0.01, 
+                optimizer_name='sgd', scheduler_name='step'):
     model = AttentionUNet(n_channels=3, n_classes=n_classes).to(device)
-    train_loader = setup_data_loader(train_dataset, batch_size=4)  # Increased from 2
+    train_loader = setup_data_loader(train_dataset, batch_size=4)
     
     class_weights = calculate_advanced_class_weights(train_loader, n_classes, device)
     
-    # Modified loss weights
     criterion = AdvancedFocalDiceLoss(
-        focal_weight=0.3,  # Reduced from 0.5
-        dice_weight=0.7,   # Increased from 0.5
+        focal_weight=0.3,
+        dice_weight=0.7,
         gamma=2,
         alpha=class_weights
     )
     
-    # Changed to AdamW with weight decay
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=learning_rate,
-        weight_decay=1e-4
-    )
+    # Create optimizer using factory function
+    optimizer = get_optimizer(optimizer_name, model.parameters(), learning_rate)
     
-    # Modified scheduler parameters
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode='min',
-        factor=0.5,  # Changed from 0.1
-        patience=5,   # Changed from 10
-        min_lr=1e-6
-    )
+    # Create scheduler using factory function
+    scheduler = get_scheduler(scheduler_name, optimizer)
+    
     return model, criterion, optimizer, scheduler
 
 def save_model(model, optimizer, num_epochs, metrics, save_path='unet_model.pth'):
@@ -726,64 +779,126 @@ def plot_training_results(train_losses, val_losses, train_accuracies, val_accura
     plt.savefig('training_results.png')
     plt.close()
 
+def train_with_multiple_optimizers(device, train_dataset, val_dataset, class_names, args):
+    """Train the model with different optimizers and compare results"""
+    optimizers = ['sgd', 'adam', 'adamw', 'rmsprop', 'adadelta']
+    results = {}
+    
+    for opt_name in optimizers:
+        logging.info(f"\n{'='*50}")
+        logging.info(f"Training with {opt_name.upper()} optimizer")
+        logging.info(f"{'='*50}\n")
+        
+        # Setup model, criterion, optimizer and scheduler
+        model, criterion, optimizer, scheduler = setup_model(
+            device, 
+            train_dataset, 
+            learning_rate=args.learning_rate,
+            optimizer_name=opt_name,
+            scheduler_name=args.scheduler
+        )
+        
+        train_loader = setup_data_loader(train_dataset, args.batch_size)
+        val_loader = setup_data_loader(val_dataset, args.batch_size)
+        
+        # Train model
+        model, metrics = train_model(
+            model, train_loader, val_loader, criterion, optimizer, 
+            scheduler, device, args.num_epochs, class_names
+        )
+        
+        # Store results
+        results[opt_name] = {
+            'final_train_loss': metrics['train_losses'][-1],
+            'final_val_loss': metrics['val_losses'][-1],
+            'final_val_accuracy': metrics['val_accuracies'][-1],
+            'final_val_f1': metrics['val_f1s'][-1],
+            'final_val_jaccard': metrics['val_jaccards'][-1],
+            'train_losses': metrics['train_losses'],
+            'val_losses': metrics['val_losses'],
+            'val_accuracies': metrics['val_accuracies'],
+            'val_f1s': metrics['val_f1s']
+        }
+        
+        # Save model for this optimizer
+        SAVE_DIR = os.path.join(os.getcwd(), 'saved_models')
+        os.makedirs(SAVE_DIR, exist_ok=True)
+        save_path = os.path.join(SAVE_DIR, f'model_{opt_name}.pth')
+        save_model(model, optimizer, args.num_epochs, metrics, save_path=save_path)
+        
+        # Clear memory
+        del model, optimizer, scheduler, train_loader, val_loader
+        torch.cuda.empty_cache()
+    
+    return results
+
+def plot_optimizer_comparison(results):
+    """Plot comparison of different optimizers"""
+    metrics = ['train_losses', 'val_losses', 'val_accuracies', 'val_f1s']
+    titles = ['Training Loss', 'Validation Loss', 'Validation Accuracy', 'Validation F1 Score']
+    
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    axes = axes.ravel()
+    
+    for idx, (metric, title) in enumerate(zip(metrics, titles)):
+        for opt_name, opt_results in results.items():
+            axes[idx].plot(opt_results[metric], label=opt_name.upper())
+        axes[idx].set_title(title)
+        axes[idx].set_xlabel('Epoch')
+        axes[idx].legend()
+    
+    plt.tight_layout()
+    plt.savefig('optimizer_comparison.png')
+    plt.close()
+
 def main():
-    set_seed()  # Add seed setting
+    set_seed()
     setup_logging()
     parser = argparse.ArgumentParser(description='Coconut Tree Disease Detection')
     parser.add_argument('--train', action='store_true', help='Train the model')
-    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')  # Changed default
-    parser.add_argument('--batch_size', type=int, default=4, help="Batch size for training")  # Changed default
+    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--batch_size', type=int, default=4, help="Batch size for training")
+    parser.add_argument('--scheduler', type=str, default='step',
+                      choices=['step', 'plateau', 'cosine'],
+                      help='Learning rate scheduler to use')
+    parser.add_argument('--num_epochs', type=int, default=50, help='Number of epochs')
     args = parser.parse_args()
 
     device = setup_device()
-    NUM_EPOCHS = 50
 
     if args.train:
         try:
-            # Set memory management parameters
             torch.backends.cudnn.benchmark = True
             torch.cuda.empty_cache()
             
-            root_dir = r"S:\SEM3\COMPUTER NETWORKS\project\train"  # Replace with your training data directory
+            root_dir = r"S:\SEM3\COMPUTER NETWORKS\project\train"
             train_dataset, val_dataset, class_names = create_datasets(root_dir)
             
-            batch_size = args.batch_size  # Use command line argument
+            # Train with all optimizers
+            results = train_with_multiple_optimizers(
+                device, train_dataset, val_dataset, class_names, args
+            )
             
-            train_loader = setup_data_loader(train_dataset, batch_size)
-            val_loader = setup_data_loader(val_dataset, batch_size)
-
-            model, criterion, optimizer, scheduler = setup_model(
-                device, train_dataset, learning_rate=args.learning_rate
-            )
-
-            model, metrics = train_model(
-                model, train_loader, val_loader, criterion, optimizer, scheduler, device, NUM_EPOCHS, class_names
-            )
-
-            # Print final metrics
-            print(f"Final Train Loss: {metrics['train_losses'][-1]:.4f}")
-            print(f"Final Validation Loss: {metrics['val_losses'][-1]:.4f}")
-            print(f"Final Validation Accuracy: {metrics['val_accuracies'][-1]:.4f}")
-            print(f"Final Validation F1-score: {metrics['val_f1s'][-1]:.4f}")
-            print(f"Final Validation Jaccard Index: {metrics['val_jaccards'][-1]:.4f}")
-
-            # Plot training results
-            plot_training_results(
-                metrics['train_losses'], 
-                metrics['val_losses'],
-                metrics['train_accuracies'], 
-                metrics['val_accuracies'],
-                metrics['train_f1s'], 
-                metrics['val_f1s'],
-                metrics['train_jaccards'], 
-                metrics['val_jaccards']
-            )
-
-            SAVE_DIR = os.path.join(os.getcwd(), 'saved_models')
-            os.makedirs(SAVE_DIR, exist_ok=True)
-            MODEL_SAVE_PATH = os.path.join(SAVE_DIR, 'final_unet_model.pth')  # Use a descriptive name
-
-            save_model(model, optimizer, NUM_EPOCHS, metrics, save_path=MODEL_SAVE_PATH)
+            # Print comparison
+            print("\nOptimizer Comparison Results:")
+            print("-" * 50)
+            metrics_to_compare = ['final_val_loss', 'final_val_accuracy', 'final_val_f1', 'final_val_jaccard']
+            
+            for metric in metrics_to_compare:
+                print(f"\n{metric}:")
+                for opt_name, opt_results in results.items():
+                    print(f"{opt_name.upper()}: {opt_results[metric]:.4f}")
+            
+            # Plot comparison
+            plot_optimizer_comparison(results)
+            
+            # Save results to file
+            with open('optimizer_comparison_results.txt', 'w') as f:
+                for opt_name, opt_results in results.items():
+                    f.write(f"\nResults for {opt_name.upper()}:\n")
+                    for metric, value in opt_results.items():
+                        if not isinstance(value, list):
+                            f.write(f"{metric}: {value:.4f}\n")
 
         except Exception as e:
             logging.error(f"Training failed: {str(e)}")
