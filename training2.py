@@ -61,7 +61,7 @@ class UNet(nn.Module):
     def forward(self, x):
         # Update size validation
         if x.size(2) != 256 or x.size(3) != 256:
-            raise ValueError(f"Input size must be 256x256, got {x.size(2)}x{x.size(3)}")
+            raise ValueError("Input image size must be 256x256")
             
         x1 = self.inc(x)
         x2 = self.down1(x1)
@@ -151,7 +151,7 @@ class AttentionUNet(UNet):
     def forward(self, x):
         # Update size validation to match new dimensions
         if x.size(2) != 256 or x.size(3) != 256:
-            raise ValueError(f"Input size must be 256x256, got {x.size(2)}x{x.size(3)}")
+            raise ValueError("Input image size must be 256x256")
             
         x1 = self.inc(x)
         x2 = self.down1(x1)
@@ -167,6 +167,83 @@ class AttentionUNet(UNet):
         x = self.up4(x, x1)
         logits = self.outc(x)
         return logits
+    
+# Add after the AttentionUNet class
+
+class VanillaUNet(nn.Module):
+    """Standard UNet without attention mechanisms"""
+    def __init__(self, n_channels=3, n_classes=5, bilinear=False):
+        super(VanillaUNet, self).__init__()
+        self.n_channels = n_channels
+        self.n_classes = n_classes
+        self.bilinear = bilinear
+
+        # Modified filter sizes for 256x256 input (same as your UNet)
+        self.inc = DoubleConv(n_channels, 32)
+        self.down1 = Down(32, 64)
+        self.down2 = Down(64, 128)
+        self.down3 = Down(128, 256)
+        self.down4 = Down(256, 256)
+        self.up1 = Up(512, 128)
+        self.up2 = Up(256, 64)
+        self.up3 = Up(128, 32)
+        self.up4 = Up(64, 32)
+        self.outc = OutConv(32, n_classes)
+
+    def forward(self, x):
+        if x.size(2) != 256 or x.size(3) != 256:
+            raise ValueError("Input image size must be 256x256")
+            
+        x1 = self.inc(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        x5 = self.down4(x4)
+        x = self.up1(x5, x4)
+        x = self.up2(x, x3)
+        x = self.up3(x, x2)
+        x = self.up4(x, x1)
+        logits = self.outc(x)
+        return logits
+
+# Add individual loss functions after your existing loss classes
+class SimpleDiceLoss(nn.Module):
+    """Standard Dice Loss without modifications"""
+    def __init__(self, smooth=1e-6):
+        super(SimpleDiceLoss, self).__init__()
+        self.smooth = smooth
+
+    def forward(self, inputs, targets):
+        inputs = F.softmax(inputs, dim=1)
+        targets_one_hot = F.one_hot(targets.long(), num_classes=inputs.size(1)).permute(0, 3, 1, 2).float()
+        
+        intersection = (inputs * targets_one_hot).sum(dim=(2, 3))
+        union = inputs.sum(dim=(2, 3)) + targets_one_hot.sum(dim=(2, 3))
+        
+        dice = (2. * intersection + self.smooth) / (union + self.smooth)
+        return 1 - dice.mean()
+
+class SimpleFocalLoss(nn.Module):
+    """Standard Focal Loss without class weighting"""
+    def __init__(self, alpha=1, gamma=2):
+        super(SimpleFocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1-pt)**self.gamma * ce_loss
+        return focal_loss.mean()
+
+class CrossEntropyLoss(nn.Module):
+    """Standard Cross Entropy Loss"""
+    def __init__(self):
+        super(CrossEntropyLoss, self).__init__()
+        self.ce = nn.CrossEntropyLoss()
+
+    def forward(self, inputs, targets):
+        return self.ce(inputs, targets)
 
 class FocalDiceLoss(nn.Module):
     def __init__(self, focal_weight=0.5, dice_weight=0.5, gamma=2):
@@ -248,9 +325,9 @@ class SegmentationDataset(Dataset):
 
     def _validate_directories(self):
         if not os.path.exists(self.images_dir):
-            raise FileNotFoundError(f"Images directory not found: {self.images_dir}")
+            raise ValueError(f"Images directory not found: {self.images_dir}")
         if not os.path.exists(self.masks_dir):
-            raise FileNotFoundError(f"Masks directory not found: {self.masks_dir}")
+            raise ValueError(f"Masks directory not found: {self.masks_dir}")
 
         image_files = {os.path.splitext(f)[0]: f for f in os.listdir(self.images_dir)}
         mask_files = {os.path.splitext(f)[0]: f for f in os.listdir(self.masks_dir)}
@@ -456,24 +533,51 @@ def get_scheduler(scheduler_name, optimizer, **kwargs):
     
     return schedulers.get(scheduler_name.lower())()
 
+# Replace your existing setup_model function
+
 def setup_model(device, train_dataset, n_classes=5, learning_rate=0.01, 
-                optimizer_name='sgd', scheduler_name='step'):
-    model = AttentionUNet(n_channels=3, n_classes=n_classes).to(device)
-    train_loader = setup_data_loader(train_dataset, batch_size=4)
+                optimizer_name='sgd', scheduler_name='step', 
+                model_type='attention_unet', loss_type='advanced_focal_dice'):
+    """Setup model with different architectures and loss functions"""
     
-    class_weights = calculate_advanced_class_weights(train_loader, n_classes, device)
+    # Model selection
+    if model_type == 'vanilla_unet':
+        model = VanillaUNet(n_channels=3, n_classes=n_classes)
+        print(f"Using Vanilla UNet")
+    elif model_type == 'attention_unet':
+        model = AttentionUNet(n_channels=3, n_classes=n_classes)
+        print(f"Using Attention UNet")
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
     
-    criterion = AdvancedFocalDiceLoss(
-        focal_weight=0.3,
-        dice_weight=0.7,
-        gamma=2,
-        alpha=class_weights
-    )
+    model = model.to(device)
     
-    # Create optimizer using factory function
+    # Loss function selection
+    if loss_type == 'cross_entropy':
+        criterion = CrossEntropyLoss()
+    elif loss_type == 'dice':
+        criterion = SimpleDiceLoss()
+    elif loss_type == 'focal':
+        criterion = SimpleFocalLoss()
+    elif loss_type == 'advanced_focal_dice':
+        # For advanced loss, calculate class weights
+        train_loader = setup_data_loader(train_dataset, batch_size=4)
+        class_weights = calculate_advanced_class_weights(train_loader, n_classes, device)
+        criterion = AdvancedFocalDiceLoss(
+            focal_weight=0.3,
+            dice_weight=0.7,
+            gamma=2,
+            alpha=class_weights
+        )
+    else:
+        raise ValueError(f"Unknown loss type: {loss_type}")
+    
+    print(f"Using {loss_type} loss")
+    
+    # Optimizer
     optimizer = get_optimizer(optimizer_name, model.parameters(), learning_rate)
     
-    # Create scheduler using factory function
+    # Scheduler
     scheduler = get_scheduler(scheduler_name, optimizer)
     
     return model, criterion, optimizer, scheduler
@@ -832,6 +936,75 @@ def train_with_multiple_optimizers(device, train_dataset, val_dataset, class_nam
     
     return results
 
+# Add this function after train_with_multiple_optimizers
+
+def train_ablation_study(device, train_dataset, val_dataset, class_names, args):
+    """Perform ablation study with different models and loss functions"""
+    
+    # Define variants to test
+    variants = [
+        {'model_type': 'vanilla_unet', 'loss_type': 'cross_entropy', 'name': 'Vanilla_UNet_CrossEntropy'},
+        {'model_type': 'vanilla_unet', 'loss_type': 'dice', 'name': 'Vanilla_UNet_Dice'},
+        {'model_type': 'vanilla_unet', 'loss_type': 'focal', 'name': 'Vanilla_UNet_Focal'},
+        {'model_type': 'attention_unet', 'loss_type': 'cross_entropy', 'name': 'Attention_UNet_CrossEntropy'},
+        {'model_type': 'attention_unet', 'loss_type': 'dice', 'name': 'Attention_UNet_Dice'},
+        {'model_type': 'attention_unet', 'loss_type': 'focal', 'name': 'Attention_UNet_Focal'},
+        {'model_type': 'attention_unet', 'loss_type': 'advanced_focal_dice', 'name': 'Attention_UNet_AdvancedFocalDice'},
+    ]
+    
+    results = {}
+    
+    for variant in variants:
+        print(f"\n{'='*60}")
+        print(f"Training: {variant['name']}")
+        print(f"{'='*60}")
+        
+        # Setup data loaders
+        train_loader = setup_data_loader(train_dataset, args.batch_size)
+        val_loader = setup_data_loader(val_dataset, args.batch_size)
+        
+        # Setup model with specific variant
+        model, criterion, optimizer, scheduler = setup_model(
+            device, train_dataset, n_classes=len(class_names),
+            learning_rate=args.learning_rate, optimizer_name='adam',  # Use Adam for consistency
+            scheduler_name=args.scheduler, model_type=variant['model_type'],
+            loss_type=variant['loss_type']
+        )
+        
+        # Train model
+        model, metrics = train_model(
+            model, train_loader, val_loader, criterion, optimizer, 
+            scheduler, device, args.num_epochs, class_names
+        )
+        
+        # Store results
+        results[variant['name']] = {
+            'final_train_loss': metrics['train_losses'][-1],
+            'final_val_loss': metrics['val_losses'][-1],
+            'final_val_accuracy': metrics['val_accuracies'][-1],
+            'final_val_f1': metrics['val_f1s'][-1],
+            'final_val_jaccard': metrics['val_jaccards'][-1],
+            'train_losses': metrics['train_losses'],
+            'val_losses': metrics['val_losses'],
+            'val_accuracies': metrics['val_accuracies'],
+            'val_f1s': metrics['val_f1s'],
+            'val_jaccards': metrics['val_jaccards'],
+            'model_type': variant['model_type'],
+            'loss_type': variant['loss_type']
+        }
+        
+        # Save model for this variant
+        SAVE_DIR = os.path.join(os.getcwd(), 'saved_models', 'ablation_study')
+        os.makedirs(SAVE_DIR, exist_ok=True)
+        save_path = os.path.join(SAVE_DIR, f'{variant["name"]}.pth')
+        save_model(model, optimizer, args.num_epochs, metrics, save_path=save_path)
+        
+        # Clear memory
+        del model, optimizer, scheduler, criterion, train_loader, val_loader
+        torch.cuda.empty_cache()
+    
+    return results
+
 def plot_optimizer_comparison(results):
     """Plot comparison of different optimizers"""
     metrics = ['train_losses', 'val_losses', 'val_accuracies', 'val_f1s']
@@ -851,11 +1024,81 @@ def plot_optimizer_comparison(results):
     plt.savefig('optimizer_comparison.png')
     plt.close()
 
+# Add this function after plot_optimizer_comparison
+
+def plot_ablation_comparison(results):
+    """Plot comparison of different model architectures and loss functions"""
+    
+    # Separate results by model type
+    vanilla_results = {k: v for k, v in results.items() if 'Vanilla' in k}
+    attention_results = {k: v for k, v in results.items() if 'Attention' in k}
+    
+    # Plot 1: Model Architecture Comparison
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    axes = axes.ravel()
+    
+    metrics = ['val_losses', 'val_accuracies', 'val_f1s', 'val_jaccards']
+    titles = ['Validation Loss', 'Validation Accuracy', 'Validation F1 Score', 'Validation Jaccard Index']
+    
+    for idx, (metric, title) in enumerate(zip(metrics, titles)):
+        # Plot vanilla UNet variants
+        for name, result in vanilla_results.items():
+            loss_name = name.split('_')[-1]
+            axes[idx].plot(result[metric], label=f'Vanilla UNet + {loss_name}', linestyle='--')
+        
+        # Plot attention UNet variants
+        for name, result in attention_results.items():
+            loss_name = name.split('_')[-1]
+            axes[idx].plot(result[metric], label=f'Attention UNet + {loss_name}')
+        
+        axes[idx].set_title(title)
+        axes[idx].set_xlabel('Epoch')
+        axes[idx].legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    
+    plt.tight_layout()
+    plt.savefig('ablation_study_comparison.png', bbox_inches='tight', dpi=300)
+    plt.close()
+    
+    # Plot 2: Final Results Comparison
+    fig, ax = plt.subplots(figsize=(12, 8))
+    
+    names = list(results.keys())
+    final_f1s = [results[name]['final_val_f1'] for name in names]
+    final_accuracies = [results[name]['final_val_accuracy'] for name in names]
+    
+    x = np.arange(len(names))
+    width = 0.35
+    
+    bars1 = ax.bar(x - width/2, final_f1s, width, label='F1 Score', alpha=0.8)
+    bars2 = ax.bar(x + width/2, final_accuracies, width, label='Accuracy', alpha=0.8)
+    
+    ax.set_xlabel('Model Variants')
+    ax.set_ylabel('Score')
+    ax.set_title('Final Validation Metrics Comparison')
+    ax.set_xticks(x)
+    ax.set_xticklabels([name.replace('_', ' ') for name in names], rotation=45, ha='right')
+    ax.legend()
+    
+    # Add value labels on bars
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            height = bar.get_height()
+            ax.annotate(f'{height:.3f}',
+                       xy=(bar.get_x() + bar.get_width() / 2, height),
+                       xytext=(0, 3),
+                       textcoords="offset points",
+                       ha='center', va='bottom', fontsize=8)
+    
+    plt.tight_layout()
+    plt.savefig('ablation_final_metrics.png', bbox_inches='tight', dpi=300)
+    plt.close()
+
 def main():
     set_seed()
     setup_logging()
     parser = argparse.ArgumentParser(description='Coconut Tree Disease Detection')
     parser.add_argument('--train', action='store_true', help='Train the model')
+    parser.add_argument('--ablation', action='store_true', help='Run ablation study')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--batch_size', type=int, default=4, help="Batch size for training")
     parser.add_argument('--scheduler', type=str, default='step',
@@ -866,7 +1109,7 @@ def main():
 
     device = setup_device()
 
-    if args.train:
+    if args.train or args.ablation:
         try:
             torch.backends.cudnn.benchmark = True
             torch.cuda.empty_cache()
@@ -874,31 +1117,65 @@ def main():
             root_dir = r"S:\SEM3\COMPUTER NETWORKS\project\train"
             train_dataset, val_dataset, class_names = create_datasets(root_dir)
             
-            # Train with all optimizers
-            results = train_with_multiple_optimizers(
-                device, train_dataset, val_dataset, class_names, args
-            )
+            if args.ablation:
+                # Run ablation study
+                print("Starting Ablation Study...")
+                results = train_ablation_study(
+                    device, train_dataset, val_dataset, class_names, args
+                )
+                
+                # Print ablation results
+                print("\nAblation Study Results:")
+                print("=" * 80)
+                metrics_to_compare = ['final_val_loss', 'final_val_accuracy', 'final_val_f1', 'final_val_jaccard']
+                
+                for metric in metrics_to_compare:
+                    print(f"\n{metric}:")
+                    for variant_name, variant_results in results.items():
+                        print(f"{variant_name}: {variant_results[metric]:.4f}")
+                
+                # Plot ablation comparison
+                plot_ablation_comparison(results)
+                
+                # Save ablation results to file
+                with open('ablation_study_results.txt', 'w') as f:
+                    f.write("Ablation Study Results\n")
+                    f.write("=" * 50 + "\n\n")
+                    for variant_name, variant_results in results.items():
+                        f.write(f"\nResults for {variant_name}:\n")
+                        f.write(f"Model Type: {variant_results['model_type']}\n")
+                        f.write(f"Loss Type: {variant_results['loss_type']}\n")
+                        for metric, value in variant_results.items():
+                            if not isinstance(value, (list, str)):
+                                f.write(f"{metric}: {value:.4f}\n")
+                        f.write("-" * 40 + "\n")
             
-            # Print comparison
-            print("\nOptimizer Comparison Results:")
-            print("-" * 50)
-            metrics_to_compare = ['final_val_loss', 'final_val_accuracy', 'final_val_f1', 'final_val_jaccard']
-            
-            for metric in metrics_to_compare:
-                print(f"\n{metric}:")
-                for opt_name, opt_results in results.items():
-                    print(f"{opt_name.upper()}: {opt_results[metric]:.4f}")
-            
-            # Plot comparison
-            plot_optimizer_comparison(results)
-            
-            # Save results to file
-            with open('optimizer_comparison_results.txt', 'w') as f:
-                for opt_name, opt_results in results.items():
-                    f.write(f"\nResults for {opt_name.upper()}:\n")
-                    for metric, value in opt_results.items():
-                        if not isinstance(value, list):
-                            f.write(f"{metric}: {value:.4f}\n")
+            elif args.train:
+                # Train with all optimizers (original functionality)
+                results = train_with_multiple_optimizers(
+                    device, train_dataset, val_dataset, class_names, args
+                )
+                
+                # Print comparison
+                print("\nOptimizer Comparison Results:")
+                print("-" * 50)
+                metrics_to_compare = ['final_val_loss', 'final_val_accuracy', 'final_val_f1', 'final_val_jaccard']
+                
+                for metric in metrics_to_compare:
+                    print(f"\n{metric}:")
+                    for opt_name, opt_results in results.items():
+                        print(f"{opt_name.upper()}: {opt_results[metric]:.4f}")
+                
+                # Plot comparison
+                plot_optimizer_comparison(results)
+                
+                # Save results to file
+                with open('optimizer_comparison_results.txt', 'w') as f:
+                    for opt_name, opt_results in results.items():
+                        f.write(f"\nResults for {opt_name.upper()}:\n")
+                        for metric, value in opt_results.items():
+                            if not isinstance(value, list):
+                                f.write(f"{metric}: {value:.4f}\n")
 
         except Exception as e:
             logging.error(f"Training failed: {str(e)}")
